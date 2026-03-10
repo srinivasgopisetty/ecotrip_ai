@@ -4,13 +4,19 @@ import json
 import math
 import requests
 import re
-from sklearn.cluster import KMeans
+import os
+from sklearn.cluster import KMeans, AgglomerativeClustering
 from sklearn.metrics import silhouette_score
 
 # ──────────────────────────────────────────────────────────
 # CONFIGURATION
 # ──────────────────────────────────────────────────────────
-MAX_DAILY_TRAVEL_KM = 350   # Slightly higher to cover long hops
+MAX_DAILY_TRAVEL_KM = 200
+ISLAND_STATES = {"Andaman & Nicobar", "Lakshadweep"}
+HUB_DISTANCE_THRESHOLD = {
+    'railway': 50,   # km
+    'airport': 100   # km
+}
 
 # ──────────────────────────────────────────────────────────
 # 1. LOAD DATASET
@@ -47,6 +53,30 @@ if 'typical_duration' not in df.columns:
     df['typical_duration'] = 2
 else:
     df['typical_duration'] = df['typical_duration'].fillna(2)
+
+# Create a mapping from place name to state (for island check)
+place_to_state = df.set_index('destination_name')['state'].to_dict()
+
+# ----- FEATURE UTILS -----
+def parse_budget(row, category):
+    try:
+        rng = row.get(category, {}).get('total_daily_range', [0, 0])
+        return np.mean(rng) if isinstance(rng, list) and len(rng) == 2 else 0
+    except:
+        return 0
+
+df['daily_cost_budget'] = df.apply(lambda row: parse_budget(row, 'budget_category'), axis=1)
+df['daily_cost_mid'] = df.apply(lambda row: parse_budget(row, 'mid_range_category'), axis=1)
+df['daily_cost_luxury'] = df.apply(lambda row: parse_budget(row, 'luxury_category'), axis=1)
+
+accessibility_map = {"Easy": 3, "Moderate": 2, "Difficult": 1, "Hard": 1}
+df['accessibility_score'] = df['accessibility'].map(lambda x: accessibility_map.get(x, 2) if isinstance(x, str) else 2)
+
+df['safety_rating'] = pd.to_numeric(df['safety_rating'], errors='coerce').fillna(5)
+df['altitude_m'] = pd.to_numeric(df['altitude_m'], errors='coerce').fillna(0)
+df['minimum_days'] = pd.to_numeric(df['minimum_days'], errors='coerce').fillna(1)
+df['ideal_days'] = pd.to_numeric(df['ideal_days'], errors='coerce').fillna(2)
+df['maximum_days'] = pd.to_numeric(df['maximum_days'], errors='coerce').fillna(3)
 
 # ──────────────────────────────────────────────────────────
 # 2. GREEN SCORE
@@ -132,22 +162,79 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * c
 
 def calculate_carbon(dist_km, mode='car'):
-    factors = {'car': 0.12, 'bus': 0.08, 'train': 0.06, 'flight': 0.25}
+    factors = {'car': 0.12, 'bus': 0.08, 'train': 0.06, 'flight': 0.25, 'ferry': 0.05}
     return round(dist_km * factors.get(mode, 0.12), 1)
 
-def suggest_transport(dist_km):
-    if dist_km < 200:
-        mode = 'bus'
-        price_estimate = int(dist_km * 2)
-    elif dist_km < 500:
-        mode = 'train'
-        price_estimate = int(dist_km * 1.5)
-    else:
-        mode = 'flight'
-        price_estimate = int(dist_km * 5)
-    return mode, price_estimate
+def suggest_transport_between(place1, place2, dist_km):
+    """
+    Suggest transport mode based on hub availability at both places.
+    place1, place2 are destination names (strings). If a place is a custom start (not in hub_info), fallback to distance.
+    Returns (mode, price_estimate)
+    """
+    # Check if EITHER place is in island states -> ferry / flight
+    if place1 in place_to_state or place2 in place_to_state:
+        state1 = place_to_state.get(place1)
+        state2 = place_to_state.get(place2)
+        if state1 in ISLAND_STATES or state2 in ISLAND_STATES:
+            if dist_km < 150 or (state1 in ISLAND_STATES and state2 in ISLAND_STATES):
+                return 'ferry', int(dist_km * 3)
+            else:
+                return 'flight', int(dist_km * 5)
 
-_distance_cache = {}
+    # Get hub info for both places (if available)
+    info1 = hub_info.get(place1, {})
+    info2 = hub_info.get(place2, {})
+
+    # Check railway availability (both have railway within threshold)
+    rail1 = info1.get('railway') if info1 else None
+    rail2 = info2.get('railway') if info2 else None
+    if rail1 and rail2:
+        if rail1[1] <= HUB_DISTANCE_THRESHOLD['railway'] and rail2[1] <= HUB_DISTANCE_THRESHOLD['railway']:
+            return 'train', int(dist_km * 1.5)
+
+    # Check airport availability (both have airport within threshold)
+    air1 = info1.get('airport') if info1 else None
+    air2 = info2.get('airport') if info2 else None
+    if air1 and air2:
+        if air1[1] <= HUB_DISTANCE_THRESHOLD['airport'] and air2[1] <= HUB_DISTANCE_THRESHOLD['airport']:
+            return 'flight', int(dist_km * 5)
+
+    # Fallback to distance-based
+    if dist_km < 200:
+        return 'bus', int(dist_km * 2)
+    elif dist_km < 500:
+        return 'train', int(dist_km * 1.5)
+    else:
+        return 'flight', int(dist_km * 5)
+
+# ... (other helpers: get_driving_distance, adjust_days, clustering utilities, TSP solvers, etc. - all unchanged from previous version)
+# For brevity, I'm including the full code with all functions; assume they are present.
+# (In practice, the user will replace their existing file with this combined version.)
+
+# ──────────────────────────────────────────────────────────
+# 5. DISTANCE CACHE AND GEOAPIFY
+# ──────────────────────────────────────────────────────────
+_DISTANCE_CACHE_FILE = "distance_cache.json"
+
+def _load_distance_cache():
+    if os.path.exists(_DISTANCE_CACHE_FILE):
+        try:
+            with open(_DISTANCE_CACHE_FILE, "r") as f:
+                data = json.load(f)
+                return {tuple(map(float, k.split(','))): tuple(v) for k, v in data.items()}
+        except Exception:
+            return {}
+    return {}
+
+def _save_distance_cache(cache):
+    try:
+        data = {f"{k[0]},{k[1]},{k[2]},{k[3]}": v for k, v in cache.items()}
+        with open(_DISTANCE_CACHE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+_distance_cache = _load_distance_cache()
 
 def get_driving_distance(origin_lat, origin_lon, dest_lat, dest_lon, api_key=None):
     key = (origin_lat, origin_lon, dest_lat, dest_lon)
@@ -155,33 +242,41 @@ def get_driving_distance(origin_lat, origin_lon, dest_lat, dest_lon, api_key=Non
         return _distance_cache[key]
 
     if api_key:
-        url = "https://maps.googleapis.com/maps/api/distancematrix/json"
+        url = "https://api.geoapify.com/v1/routing"
         params = {
-            'origins': f"{origin_lat},{origin_lon}",
-            'destinations': f"{dest_lat},{dest_lon}",
-            'key': api_key,
-            'mode': 'driving'
+            'waypoints': f"{origin_lat},{origin_lon}|{dest_lat},{dest_lon}",
+            'mode': 'drive',
+            'apiKey': api_key
         }
         try:
             response = requests.get(url, params=params, timeout=5)
             data = response.json()
-            if data['status'] == 'OK':
-                element = data['rows'][0]['elements'][0]
-                if element['status'] == 'OK':
-                    dist_m = element['distance']['value']
-                    duration_s = element['duration']['value']
-                    _distance_cache[key] = (dist_m / 1000, duration_s / 3600)
+            
+            if response.status_code != 200:
+                print(f"Geoapify HTTP {response.status_code}: {data.get('error', 'Unknown error')}")
+            elif 'features' in data and len(data['features']) > 0:
+                props = data['features'][0]['properties']
+                dist_m = props.get('distance')
+                time_s = props.get('time')
+                if dist_m is not None and time_s is not None:
+                    _distance_cache[key] = (dist_m / 1000, time_s / 3600)
+                    _save_distance_cache(_distance_cache)
                     return _distance_cache[key]
+                else:
+                    print("Geoapify: missing distance/time in properties")
+            else:
+                print(f"Geoapify: no features found – check API key/permissions")
         except Exception as e:
-            print(f"API error: {e}, falling back to haversine")
+            print(f"Geoapify error: {e}")
 
     dist_km = haversine(origin_lat, origin_lon, dest_lat, dest_lon)
     duration_h = dist_km / 50
     _distance_cache[key] = (dist_km, duration_h)
+    _save_distance_cache(_distance_cache)
     return dist_km, duration_h
 
 # ──────────────────────────────────────────────────────────
-# 5. DAY ADJUSTMENT
+# 6. DAY ADJUSTMENT
 # ──────────────────────────────────────────────────────────
 def adjust_days(num_days, total_places, max_places_per_day, is_india_full=False):
     required = math.ceil(total_places / max_places_per_day)
@@ -197,10 +292,9 @@ def adjust_days(num_days, total_places, max_places_per_day, is_india_full=False)
     return required, msg
 
 # ──────────────────────────────────────────────────────────
-# 6. CLUSTERING UTILITIES
+# 7. CLUSTERING UTILITIES
 # ──────────────────────────────────────────────────────────
 def reassign_empty_clusters(labels, n_clusters):
-    """Move points from largest cluster to fill any empty clusters."""
     unique, counts = np.unique(labels, return_counts=True)
     cluster_counts = dict(zip(unique, counts))
     empty_clusters = [c for c in range(n_clusters) if c not in cluster_counts]
@@ -212,20 +306,25 @@ def reassign_empty_clusters(labels, n_clusters):
         labels[idx_to_move] = empty
     return labels
 
+def haversine_cluster(cluster_coords, n_clusters):
+    if len(cluster_coords) <= 1 or n_clusters == 1:
+        return np.zeros(len(cluster_coords), dtype=int)
+        
+    n = len(cluster_coords)
+    dist_matrix = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i+1, n):
+            d = haversine(cluster_coords[i][0], cluster_coords[i][1], cluster_coords[j][0], cluster_coords[j][1])
+            dist_matrix[i][j] = dist_matrix[j][i] = d
+
+    agg = AgglomerativeClustering(n_clusters=n_clusters, metric='precomputed', linkage='average')
+    return agg.fit_predict(dist_matrix)
+
 def cluster_destinations(coords, n_clusters):
-    kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
-    labels = kmeans.fit_predict(coords)
-    if 2 <= n_clusters < len(coords):
-        sil = silhouette_score(coords, labels)
-        print(f"Silhouette score for {n_clusters} clusters: {sil:.3f}")
-    return labels, kmeans.cluster_centers_
+    labels = haversine_cluster(coords, n_clusters)
+    return labels, None
 
 def split_large_clusters(day_to_indices, coords, max_places_per_day):
-    """
-    Ensure each cluster has at most max_places_per_day.
-    If a cluster is larger, split it into subclusters using KMeans.
-    Returns a new day_to_indices dictionary with possibly more clusters.
-    """
     new_day_to_indices = {}
     new_day = 0
     for cluster_id, indices in day_to_indices.items():
@@ -236,8 +335,7 @@ def split_large_clusters(day_to_indices, coords, max_places_per_day):
         else:
             n_sub = math.ceil(size / max_places_per_day)
             sub_coords = coords[indices]
-            kmeans_sub = KMeans(n_clusters=n_sub, n_init=10, random_state=42)
-            sub_labels = kmeans_sub.fit_predict(sub_coords)
+            sub_labels = haversine_cluster(sub_coords, n_sub)
             for sub in range(n_sub):
                 sub_indices = [indices[i] for i, lbl in enumerate(sub_labels) if lbl == sub]
                 new_day_to_indices[new_day] = sub_indices
@@ -245,7 +343,6 @@ def split_large_clusters(day_to_indices, coords, max_places_per_day):
     return new_day_to_indices
 
 def estimate_route_distance(indices, coords):
-    """Estimate total travel distance for a set of points using a greedy nearest neighbor tour."""
     if len(indices) <= 1:
         return 0.0
     pts = coords[indices]
@@ -270,7 +367,6 @@ def estimate_route_distance(indices, coords):
     return total
 
 def split_by_distance(day_to_indices, coords, max_km):
-    """Split any day whose internal distance exceeds max_km."""
     new_day_counter = len(day_to_indices)
     changed = True
     while changed:
@@ -284,8 +380,7 @@ def split_by_distance(day_to_indices, coords, max_km):
             if dist > max_km:
                 print(f"  Splitting day {day} (internal est. {dist:.1f} km > {max_km} km)")
                 sub_coords = coords[indices]
-                kmeans = KMeans(n_clusters=2, n_init=10, random_state=42)
-                sub_labels = kmeans.fit_predict(sub_coords)
+                sub_labels = haversine_cluster(sub_coords, 2)
                 cluster0 = [indices[i] for i, lbl in enumerate(sub_labels) if lbl == 0]
                 cluster1 = [indices[i] for i, lbl in enumerate(sub_labels) if lbl == 1]
                 del day_to_indices[day]
@@ -298,10 +393,9 @@ def split_by_distance(day_to_indices, coords, max_km):
     return day_to_indices
 
 # ──────────────────────────────────────────────────────────
-# 7. TSP SOLVERS (for points and for days)
+# 8. TSP SOLVERS (for points and for days)
 # ──────────────────────────────────────────────────────────
 def nearest_neighbor_tsp(points, start_idx=0):
-    """points: list of (lat, lon); returns order of indices and total distance."""
     n = len(points)
     if n <= 1:
         return list(range(n)), 0.0
@@ -356,7 +450,7 @@ def two_opt_tsp(points, initial_path, max_iter=100):
     return best, final_dist
 
 # ──────────────────────────────────────────────────────────
-# 8. BUILD A SINGLE DAY
+# 9. BUILD A SINGLE DAY (with updated transport suggestion)
 # ──────────────────────────────────────────────────────────
 def build_day_from_indices(day_indices, places_df, prev_lat, prev_lon, prev_name, api_key):
     day_places_df = places_df.iloc[day_indices].sort_values('final_score', ascending=False)
@@ -364,34 +458,93 @@ def build_day_from_indices(day_indices, places_df, prev_lat, prev_lon, prev_name
     day_coords = day_places_df[['latitude', 'longitude']].values
     day_durations = day_places_df['typical_duration'].values
 
+    # Prepend previous day's end
     all_coords = np.vstack([(prev_lat, prev_lon), day_coords])
     all_names = np.insert(day_places, 0, prev_name)
     all_durations = np.insert(day_durations, 0, 0)
 
     n = len(all_coords)
     if n < 2:
-        return None, prev_lat, prev_lon, prev_name, 0, 0, 0, 0, ""
+        return None, prev_lat, prev_lon, prev_name, 0, 0, 0, 0
+
+    # Remove duplicate if start point equals first destination
+    if n > 1 and all_names[0] == all_names[1]:
+        all_coords = all_coords[1:]
+        all_names = all_names[1:]
+        all_durations = all_durations[1:]
+        n -= 1
+        if n < 2:
+            return None, prev_lat, prev_lon, prev_name, 0, 0, 0, 0
 
     dist_matrix = np.zeros((n, n))
     time_matrix = np.zeros((n, n))
+    # Force local haversine distance for the NxN matrix to save time (O(n^2) API calls)
     for i in range(n):
         for j in range(i+1, n):
             d_km, t_h = get_driving_distance(all_coords[i][0], all_coords[i][1],
-                                              all_coords[j][0], all_coords[j][1], api_key)
+                                              all_coords[j][0], all_coords[j][1], api_key=None)
             dist_matrix[i][j] = dist_matrix[j][i] = d_km
             time_matrix[i][j] = time_matrix[j][i] = t_h
 
     path = nearest_neighbor(dist_matrix, start=0)
     path = two_opt(path, dist_matrix)
 
-    day_dist = sum(dist_matrix[path[k]][path[k+1]] for k in range(len(path)-1))
-    day_travel_time = sum(time_matrix[path[k]][path[k+1]] for k in range(len(path)-1))
+    # Now that path is determined, do O(n) API calls for the actual chosen segments
+    day_dist = 0
+    day_travel_time = 0
+    max_leg_dist = 0
+    max_leg_idx = -1
+    carbon = 0
+    
+    for k in range(len(path)-1):
+        idx_a = path[k]
+        idx_b = path[k+1]
+        lat_a, lon_a = all_coords[idx_a]
+        lat_b, lon_b = all_coords[idx_b]
+        
+        # Call Geoapify for exactly this solved leg
+        true_d_km, true_t_h = get_driving_distance(lat_a, lon_a, lat_b, lon_b, api_key)
+        
+        day_dist += true_d_km
+        day_travel_time += true_t_h
+        
+        if true_d_km > max_leg_dist:
+            max_leg_dist = true_d_km
+            max_leg_idx = k
+            
+        # Temporarily use default mode factor for carbon calculation sum
+        # We will recalculate the full carbon later once mode is definitive
+        pass
+
     day_visit_time = sum(all_durations[i] for i in path if i != 0)
     day_total_time = day_travel_time + day_visit_time
 
-    max_leg = max([dist_matrix[path[k]][path[k+1]] for k in range(len(path)-1)], default=0)
-    mode, price = suggest_transport(max_leg)
-    carbon = sum(calculate_carbon(dist_matrix[path[k]][path[k+1]], mode) for k in range(len(path)-1))
+    # Determine the mode for this day based on the longest leg
+    # Get the two place names for the longest leg (if both are destinations, not start)
+    if max_leg_idx != -1:
+        i = path[max_leg_idx]
+        j = path[max_leg_idx+1]
+        if i == 0 or j == 0:
+            # Leg involves the start point – use distance-based suggestion
+            mode, price = suggest_transport_between("", "", max_leg_dist)  # fallback
+        else:
+            name_i = all_names[i]
+            name_j = all_names[j]
+            mode, price = suggest_transport_between(name_i, name_j, max_leg_dist)
+    else:
+        # No legs? shouldn't happen
+        mode, price = 'car', int(max_leg_dist * 2)
+
+    # Recalculate true carbon using true distances and the final chosen mode
+    carbon = 0
+    for k in range(len(path)-1):
+        idx_a = path[k]
+        idx_b = path[k+1]
+        lat_a, lon_a = all_coords[idx_a]
+        lat_b, lon_b = all_coords[idx_b]
+        # Re-fetch from cache (O(1))
+        true_d_km, _ = get_driving_distance(lat_a, lon_a, lat_b, lon_b, api_key)
+        carbon += calculate_carbon(true_d_km, mode)
 
     route_names = [all_names[i] for i in path]
     route = " → ".join(route_names)
@@ -399,7 +552,9 @@ def build_day_from_indices(day_indices, places_df, prev_lat, prev_lon, prev_name
     end_name = route_names[-1]
     end_lat, end_lon = all_coords[path[-1]]
 
-    return {
+    original_indices = [day_indices[i-1] for i in path if i != 0]
+
+    day_info = {
         "route": route,
         "distance": round(day_dist, 1),
         "carbon": carbon,
@@ -410,8 +565,10 @@ def build_day_from_indices(day_indices, places_df, prev_lat, prev_lon, prev_name
         "end_lon": end_lon,
         "end_name": end_name,
         "origin_hub_recommendation": recommend_hubs(prev_name) if prev_name != "Custom start – no hub data" else "Custom start – no hub data",
-        "destination_hub_recommendation": recommend_hubs(end_name)
-    }, end_lat, end_lon, end_name, day_dist, carbon, price
+        "destination_hub_recommendation": recommend_hubs(end_name),
+        "indices": original_indices
+    }
+    return day_info, end_lat, end_lon, end_name, day_dist, carbon, price, len(day_indices)
 
 def nearest_neighbor(dist_matrix, start=0):
     n = len(dist_matrix)
@@ -448,18 +605,13 @@ def two_opt(path, dist_matrix, max_iterations=100):
     return best
 
 # ──────────────────────────────────────────────────────────
-# 9. GLOBAL DAY ORDERING (used after each split)
+# 10. GLOBAL DAY ORDERING
 # ──────────────────────────────────────────────────────────
 def order_days_global(day_to_indices, places_df, start_lat, start_lon):
-    """
-    Compute a TSP order for all remaining days, starting from the current position.
-    Returns a list of day keys in the optimal order.
-    """
     day_keys = list(day_to_indices.keys())
     if len(day_keys) <= 1:
         return day_keys
 
-    # Build list of representatives (highest-scored point of each day)
     reps = []
     for day in day_keys:
         indices = day_to_indices[day]
@@ -471,21 +623,17 @@ def order_days_global(day_to_indices, places_df, start_lat, start_lon):
         lon = places_df.loc[best_idx, 'longitude']
         reps.append((lat, lon))
 
-    # Solve TSP on representatives, with fixed start at current position
-    # We need to include the start point as a virtual node.
     all_points = [(start_lat, start_lon)] + reps
     n = len(all_points)
     if n <= 2:
-        return day_keys  # trivial
+        return day_keys
 
-    # Compute distance matrix
     dist_mat = np.zeros((n, n))
     for i in range(n):
         for j in range(i+1, n):
             d = haversine(all_points[i][0], all_points[i][1], all_points[j][0], all_points[j][1])
             dist_mat[i][j] = dist_mat[j][i] = d
 
-    # Greedy from start (index 0)
     path = [0]
     visited = [False] * n
     visited[0] = True
@@ -496,25 +644,46 @@ def order_days_global(day_to_indices, places_df, start_lat, start_lon):
         visited[next_node] = True
         current = next_node
 
-    # Improve with 2-opt (ignoring the start node)
-    # We'll treat path[1:] as the tour of reps
-    rep_path = path[1:]  # indices of reps (0..len(reps)-1)
-    # Convert to actual day keys: rep_path[i] corresponds to day_keys[rep_path[i]-1]? Wait careful.
-    # The reps list is in the same order as day_keys. The path includes indices from 1 to n-1, where index i in all_points corresponds to:
-    # 0: start, 1..len(reps): reps[0], reps[1], ...
-    # So rep_path contains numbers from 1 to n-1. To get the day key, we need to map: day_key = day_keys[rep_path[i]-1].
-    # But simpler: after we have the TSP order of reps, we can just return the day_keys in that order.
-    # Let's extract the order of reps from the path (excluding start).
-    rep_order_indices = [x-1 for x in path[1:]]  # now indices into reps list
-    ordered_days = [day_keys[i] for i in rep_order_indices]
+    best_path = path[:]
+    improved = True
+    for _ in range(100):
+        improved = False
+        for i in range(1, n-2):
+            for j in range(i+1, n):
+                if j - i == 1:
+                    continue
+                new_path = best_path[:i] + best_path[i:j][::-1] + best_path[j:]
+                new_dist = 0.0
+                for k in range(n-1):
+                    a, b = new_path[k], new_path[k+1]
+                    new_dist += dist_mat[a][b]
+                old_dist = 0.0
+                for k in range(n-1):
+                    a, b = best_path[k], best_path[k+1]
+                    old_dist += dist_mat[a][b]
+                if new_dist < old_dist:
+                    best_path = new_path
+                    improved = True
+        if not improved:
+            break
+
+    ordered_days = [day_keys[best_path[i]-1] for i in range(1, n) if best_path[i] != 0]
     return ordered_days
 
 # ──────────────────────────────────────────────────────────
-# 10. MAIN FUNCTION
+# 11. MAIN FUNCTION
 # ──────────────────────────────────────────────────────────
 def generate_itinerary(country="India", num_days=7, max_places_per_day=5,
                        start_location=None, state=None, api_key=None,
-                       travel_day_only=False):
+                       travel_day_only=False,
+                       # Additional Features
+                       user_budget=None, # "budget", "mid", "luxury"
+                       travel_group=None, # e.g. "Families", "Solo"
+                       accessibility_preference=None, # min score, e.g. 2 for Moderate
+                       min_safety_rating=None, # e.g. 7
+                       max_altitude=None, # e.g. 2000
+                       preferred_season=None # e.g. "Winter"
+                       ):
     places_df = df.copy()
 
     # State filter
@@ -530,14 +699,33 @@ def generate_itinerary(country="India", num_days=7, max_places_per_day=5,
     else:
         selected_region = country
 
+    # Filter based on strict requirements
+    if min_safety_rating is not None:
+        places_df = places_df[places_df['safety_rating'] >= min_safety_rating]
+    if max_altitude is not None:
+        places_df = places_df[places_df['altitude_m'] <= max_altitude]
+    if accessibility_preference is not None:
+        places_df = places_df[places_df['accessibility_score'] >= accessibility_preference]
+
+    # Initialize final_score
     places_df['final_score'] = places_df['base_score']
-    places_df = places_df.sort_values('final_score', ascending=False)
+
+    # Boost score dynamically based on user preferences
+    if travel_group:
+        places_df['final_score'] += places_df['ideal_for'].apply(
+            lambda x: 2.0 if isinstance(x, list) and any(travel_group.lower() in str(item).lower() for item in x) else 0.0
+        )
+    if preferred_season:
+        places_df['final_score'] += places_df['best_seasons'].apply(
+            lambda x: 1.0 if isinstance(x, list) and any(preferred_season.lower() in str(item).lower() for item in x) else 0.0
+        )
+
+    places_df = places_df.sort_values('final_score', ascending=False).reset_index(drop=True)
 
     total_places = len(places_df)
     if total_places == 0:
         return {"error": "No places after filtering"}
 
-    # Adjust days considering travel day
     is_india_full = (state is None and country.lower() == "india")
     effective_places = total_places + (1 if travel_day_only else 0)
     required_days, adjust_msg = adjust_days(num_days, effective_places, max_places_per_day, is_india_full)
@@ -548,12 +736,10 @@ def generate_itinerary(country="India", num_days=7, max_places_per_day=5,
         sightseeing_days = required_days
         adjust_msg = (adjust_msg or "") + " Travel day disabled because it would leave no sightseeing days."
 
-    # Data arrays
     coords = places_df[['latitude', 'longitude']].values
     names = places_df['destination_name'].values
     visit_durations = places_df['typical_duration'].values
 
-    # Starting point
     if start_location is None:
         start_lat, start_lon, start_name = 28.6139, 77.2090, "New Delhi (Start)"
         start_is_custom = True
@@ -561,18 +747,21 @@ def generate_itinerary(country="India", num_days=7, max_places_per_day=5,
         start_lat = start_location.get('lat', 28.6139)
         start_lon = start_location.get('lon', 77.2090)
         start_name = start_location.get('name', "Custom Start")
+        is_custom_explicit = start_location.get('is_custom', False)
+        
         matched = False
-        for i, name in enumerate(names):
-            if start_name.lower() in name.lower() or name.lower() in start_name.lower():
-                start_name = name
-                start_lat, start_lon = coords[i]
-                matched = True
-                break
-        start_is_custom = not matched
-        if not matched:
+        if not is_custom_explicit:
+            for i, name in enumerate(names):
+                if start_name.lower() in name.lower() or name.lower() in start_name.lower():
+                    start_name = name
+                    start_lat, start_lon = coords[i]
+                    matched = True
+                    break
+        
+        start_is_custom = is_custom_explicit or not matched
+        if start_is_custom and "(Start)" not in start_name:
             start_name = f"{start_name} (Start)"
 
-    # Initial clustering
     n_clusters = min(sightseeing_days, total_places)
     labels, centers = cluster_destinations(coords, n_clusters)
     labels = reassign_empty_clusters(labels, n_clusters)
@@ -581,10 +770,7 @@ def generate_itinerary(country="India", num_days=7, max_places_per_day=5,
     for idx, lab in enumerate(labels):
         day_to_indices[lab].append(idx)
 
-    # Split by place count
     day_to_indices = split_large_clusters(day_to_indices, coords, max_places_per_day)
-
-    # Split by internal distance (estimate)
     day_to_indices = split_by_distance(day_to_indices, coords, MAX_DAILY_TRAVEL_KM)
 
     # Build itinerary incrementally with global TSP ordering
@@ -598,9 +784,7 @@ def generate_itinerary(country="India", num_days=7, max_places_per_day=5,
     curr_is_custom = start_is_custom
     day_counter = 1
 
-    # Travel day if requested
     if travel_day_only:
-        # Find the closest day to the start point (by representative)
         reps = []
         for day, indices in day_to_indices.items():
             if indices:
@@ -620,7 +804,7 @@ def generate_itinerary(country="India", num_days=7, max_places_per_day=5,
                 first_name = places_df.loc[first_place_idx, 'destination_name']
 
                 dist_km, travel_h = get_driving_distance(curr_lat, curr_lon, first_lat, first_lon, api_key)
-                mode, price = suggest_transport(dist_km)
+                mode, price = suggest_transport_between(curr_name, first_name, dist_km)
                 carbon = calculate_carbon(dist_km, mode)
 
                 origin_recommend = "Custom start – no hub data" if curr_is_custom else recommend_hubs(curr_name)
@@ -637,7 +821,10 @@ def generate_itinerary(country="India", num_days=7, max_places_per_day=5,
                     "total_time_h": round(travel_h, 1),
                     "origin_hub_recommendation": origin_recommend,
                     "destination_hub_recommendation": dest_recommend,
-                    "warning": "Travel only – no sightseeing"
+                    "warning": "Travel only – no sightseeing",
+                    "end_lat": first_lat,
+                    "end_lon": first_lon,
+                    "end_name": first_name
                 }
                 itinerary.append(travel_day_entry)
                 total_carbon += carbon
@@ -648,16 +835,13 @@ def generate_itinerary(country="India", num_days=7, max_places_per_day=5,
                 curr_is_custom = False
                 day_counter += 1
 
-    # Now process remaining days using global TSP order
     remaining_days = list(day_to_indices.keys())
     max_iter = 100
     iter_count = 0
 
     while remaining_days and iter_count < max_iter:
         iter_count += 1
-        # Compute global TSP order for remaining days starting from current position
         ordered = order_days_global({k: day_to_indices[k] for k in remaining_days}, places_df, curr_lat, curr_lon)
-        # Process days in that order
         for next_day in ordered:
             if next_day not in remaining_days:
                 continue
@@ -666,37 +850,48 @@ def generate_itinerary(country="India", num_days=7, max_places_per_day=5,
                 remaining_days.remove(next_day)
                 continue
 
-            # Build the day
             day_result = build_day_from_indices(indices, places_df, curr_lat, curr_lon, curr_name, api_key)
-            if day_result is None:
+            if day_result[0] is None:
                 remaining_days.remove(next_day)
                 continue
 
-            day_info, new_lat, new_lon, new_name, day_dist, day_carbon, day_price = day_result
+            day_info, new_lat, new_lon, new_name, day_dist, day_carbon, day_price, num_places = day_result
 
-            # If day exceeds limit and has more than one place, split it
-            if day_dist > MAX_DAILY_TRAVEL_KM and len(indices) > 1:
-                print(f"  Splitting day {next_day} (actual {day_dist:.1f} km > {MAX_DAILY_TRAVEL_KM} km)")
+            # Check place count
+            if num_places > max_places_per_day:
+                print(f"  Splitting day {next_day} (too many places: {num_places} > {max_places_per_day})")
                 sub_coords = coords[indices]
-                kmeans = KMeans(n_clusters=2, n_init=10, random_state=42)
-                sub_labels = kmeans.fit_predict(sub_coords)
+                sub_labels = haversine_cluster(sub_coords, 2)
                 cluster0 = [indices[i] for i, lbl in enumerate(sub_labels) if lbl == 0]
                 cluster1 = [indices[i] for i, lbl in enumerate(sub_labels) if lbl == 1]
-                # Remove old day
                 del day_to_indices[next_day]
                 remaining_days.remove(next_day)
-                # Add two new days
                 new_id0 = max(day_to_indices.keys()) + 1 if day_to_indices else 0
                 new_id1 = new_id0 + 1
                 day_to_indices[new_id0] = cluster0
                 day_to_indices[new_id1] = cluster1
                 remaining_days.extend([new_id0, new_id1])
-                # Break out of the ordered loop to recompute global order
+                break
+
+            # Check distance
+            if day_dist > MAX_DAILY_TRAVEL_KM and len(indices) > 1:
+                print(f"  Splitting day {next_day} (actual {day_dist:.1f} km > {MAX_DAILY_TRAVEL_KM} km)")
+                sub_coords = coords[indices]
+                sub_labels = haversine_cluster(sub_coords, 2)
+                cluster0 = [indices[i] for i, lbl in enumerate(sub_labels) if lbl == 0]
+                cluster1 = [indices[i] for i, lbl in enumerate(sub_labels) if lbl == 1]
+                del day_to_indices[next_day]
+                remaining_days.remove(next_day)
+                new_id0 = max(day_to_indices.keys()) + 1 if day_to_indices else 0
+                new_id1 = new_id0 + 1
+                day_to_indices[new_id0] = cluster0
+                day_to_indices[new_id1] = cluster1
+                remaining_days.extend([new_id0, new_id1])
                 break
             else:
-                # Accept day (even if single-place and exceeds limit)
                 if day_dist > MAX_DAILY_TRAVEL_KM and len(indices) == 1:
                     day_info["warning"] = f"Long travel distance ({day_dist:.1f} km) – cannot split a single-place day."
+
                 day_entry = {
                     "day": day_counter,
                     "type": "sightseeing",
@@ -708,7 +903,11 @@ def generate_itinerary(country="India", num_days=7, max_places_per_day=5,
                     "total_time_h": day_info["total_time_h"],
                     "origin_hub_recommendation": day_info["origin_hub_recommendation"],
                     "destination_hub_recommendation": day_info["destination_hub_recommendation"],
-                    "warning": day_info.get("warning", "OK")
+                    "warning": day_info.get("warning", "OK"),
+                    "indices": day_info["indices"],
+                    "end_lat": day_info["end_lat"],
+                    "end_lon": day_info["end_lon"],
+                    "end_name": day_info["end_name"]
                 }
                 itinerary.append(day_entry)
                 total_carbon += day_carbon
@@ -720,14 +919,26 @@ def generate_itinerary(country="India", num_days=7, max_places_per_day=5,
                 day_counter += 1
                 remaining_days.remove(next_day)
         else:
-            # Completed all days without break
             break
 
     if iter_count >= max_iter:
         return {"error": "Failed to build itinerary within iteration limit."}
 
-    # Budget
-    per_day_accommodation = 2000
+    # Dynamic accommodation logic based on budget preference and dataset averages
+    if user_budget == 'budget' and 'daily_cost_budget' in df.columns:
+        per_day_accommodation = df['daily_cost_budget'].replace(0, np.nan).median()
+    elif user_budget == 'luxury' and 'daily_cost_luxury' in df.columns:
+        per_day_accommodation = df['daily_cost_luxury'].replace(0, np.nan).median()
+    elif 'daily_cost_mid' in df.columns:
+        per_day_accommodation = df['daily_cost_mid'].replace(0, np.nan).median()
+    else:
+        per_day_accommodation = 2000
+    
+    if pd.isna(per_day_accommodation) or per_day_accommodation == 0:
+        per_day_accommodation = 2000
+        
+    per_day_accommodation = float(per_day_accommodation) # Ensure it's JSON serializable
+
     num_itinerary_days = len(itinerary)
     total_accommodation = per_day_accommodation * num_itinerary_days
     total_budget = total_cost + total_accommodation
@@ -749,7 +960,7 @@ def generate_itinerary(country="India", num_days=7, max_places_per_day=5,
     }
 
 # ──────────────────────────────────────────────────────────
-# 11. TEST BLOCK
+# 12. TEST BLOCK
 # ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
     test_result = generate_itinerary(
@@ -759,4 +970,4 @@ if __name__ == "__main__":
         api_key=None,
         travel_day_only=True
     )
-    print(json.dumps(test_result, indent=2, ensure_ascii=False))
+    print(json.dumps(test_result, indent=2))
