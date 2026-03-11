@@ -1,39 +1,69 @@
-# 🌏 Eco‑Friendly India Trip Planner
+# 🌏 Eco-Friendly India Trip Planner (EcoTrip-AI)
 
-An AI‑powered itinerary generator that creates personalized, multi‑day eco‑friendly tours across Indian states. The system intelligently clusters destinations, optimizes daily routes, estimates carbon footprint and budget, and suggests nearest transport hubs – all in a user‑friendly Streamlit web app.
+EcoTrip-AI is an advanced, comprehensive travel itinerary planner specifically designed for exploring India sustainably. It generates optimized, multi-day tours with carbon-aware routing, sustainable transport suggestions, intelligent destination clustering, and a highly interactive visual experience. 
 
----
+## ✨ Key Features
+* **Eco-Friendly Routing:** Prioritizes sustainable travel modes (trains, ferries, buses) and calculates estimated carbon footprints for each leg of the journey based on the chosen mode.
+* **Smart Itinerary Generation:** Uses KMeans/Agglomerative Clustering along with Nearest Neighbor & 2-Opt TSP (Traveling Salesperson Problem) solvers to group destinations geographically and optimize daily travel routes.
+* **Interactive Map UI:** Visualizes your journey dynamically on an interactive Folium map within a beautiful Streamlit interface. 
+* **Custom Transport Hubs Extraction:** Automatically recommends the nearest airports and railway stations for your destinations to simplify long-distance travel, seamlessly factoring them into the itinerary path.
+* **Personalized Preferences:** Tailors your trip down to the granular details, checking variables such as user budget, travel group type, accessibility needs, safety ratings, altitude tolerance, and preferred traveling season.
+* **FastAPI Backend:** Provides a clean REST API (`/generate_itinerary`) for integrating the powerful routing engine into external client applications.
+* **Disk Caching for Performance:** Uses local JSON caching for Geoapify routing queries to dramatically boost performance and lower API call volumes.
 
-## ✨ Features
+## 🛠️ Technology Stack
+* **Frontend:** Streamlit, Streamlit-Folium, Streamlit-Lottie
+* **Backend:** FastAPI, Uvicorn
+* **Data Processing & ML:** Pandas, NumPy, Scikit-Learn
+* **Geospatial & Routing:** Geoapify API, Haversine Distance, Folium
 
-- **State‑wise or All‑India exploration** – Select specific states or cover the whole country.
-- **Smart day allocation** – Automatically adjusts the number of days to visit all selected places (enforces a minimum of 365 days for complete India tours).
-- **Geographic clustering** – Uses K‑Means to group nearby destinations into daily clusters.
-- **Optimal intra‑day routing** – Applies a nearest‑neighbour + 2‑opt TSP solver to minimise travel distance each day.
-- **Feasibility enforcement** – Splits any day exceeding 350 km or 12 hours into smaller, realistic days.
-- **Transport hub suggestions** – For every start and end point, displays the nearest airport and railway station (taken directly from the dataset).
-- **Carbon footprint & budget estimation** – Calculates daily CO₂ emissions and total trip cost (transport + ₹2000/day accommodation).
-- **Travel‑only day option** – If your start location isn’t a tourist spot, day 1 can be marked as just travel.
-- **Duplicate‑free destinations** – Aggressive name cleaning ensures each unique place appears only once.
-- **Interactive web interface** – Built with Streamlit, featuring dropdowns, sliders, and expandable day‑by‑day itineraries.
+## 🚀 Getting Started
 
----
+### Prerequisites
+* Python 3.8+
+* Geoapify API Key (Required for high-accuracy driving distance / time routing. Without it, the application cleanly falls back to mathematically simulated Haversine distances).
 
-## 🛠️ Tech Stack
-
-| Component       | Technology                         |
-|-----------------|------------------------------------|
-| Backend         | Python 3.9+, pandas, numpy, scikit‑learn |
-| Routing API     | Geoapify (falls back to Haversine) |
-| Frontend        | Streamlit                          |
-| Clustering      | K‑Means, silhouette score          |
-| Optimisation    | Nearest‑neighbour + 2‑opt TSP      |
-
----
-
-## 📦 Installation
-
-1. **Clone the repository**
+### Installation
+1. Clone the repository to your local machine:
    ```bash
-   git clone https://github.com/yourusername/eco-india-trip-planner.git
-   cd eco-india-trip-planner
+   git clone <your-repo-url>
+   cd EcoTrip-AI
+   ```
+2. Install the required Python dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. Set up your Streamlit secrets to supply the Geoapify API key:
+   Create a `.streamlit/secrets.toml` file in the root directory:
+   ```toml
+   GEOAPIFY_API_KEY = "your_geoapify_api_key_here"
+   ```
+
+### Running the Application
+
+**Option 1: Streamlit Web Application (UI)**
+Execute the main frontend entrypoint:
+```bash
+streamlit run app.py
+```
+*The web interface will automatically open in your default browser at `http://localhost:8501`.*
+
+**Option 2: FastAPI Backend Engine (API)**
+If you wish to use the logic headlessly or act as a backend for another frontend:
+```bash
+uvicorn api:app --reload
+```
+*The interactive API documentation & playground (Swagger UI) will run at `http://localhost:8000/docs`.*
+
+## 📂 Architecture overview
+* **`app.py`:** The Streamlit frontend responsible for state management, parameter input sidebars, custom styling, animations, and the comprehensive presentation of the itinerary loop.
+* **`api.py`:** The FastAPI service mapping request validation layers directly onto the generation engine. 
+* **`backend.py`:** Engine core containing data cleaning processes, green-scores, spatial clustering algorithms (TSP/k-means), feature calculations (distance/time/cost/carbon), and Geoapify HTTP interactions.
+* **`india_tourism_dataset.json`:** The expansive raw dataset containing nuanced geographical, review, transport hub, and categorical attributes for Indian points of interest.
+* **`distance_cache.json`:** System-generated disk cache mitigating repetitive and expensive spatial distance queries.
+
+## 🤝 Contributing
+Contributions, issue creations, and feature requests are very welcome! Feel free to check the issues page. Let's make travel greener!
+
+## 📜 License
+This project is licensed under the [MIT License](LICENSE) - see the LICENSE file for details.
