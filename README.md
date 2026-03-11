@@ -26,7 +26,7 @@ EcoTrip-AI is an advanced, comprehensive travel itinerary planner specifically d
 ### Installation
 1. Clone the repository to your local machine:
    ```bash
-   git clone <your-repo-url>
+   git clone https://github.com/srinivasgopisetty/ecotrip_ai.git
    cd EcoTrip-AI
    ```
 2. Install the required Python dependencies:
